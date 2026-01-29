@@ -1,0 +1,5 @@
+target
+.DS_Store
+
+/client/test/
+/server/data/

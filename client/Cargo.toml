@@ -1,0 +1,19 @@
+[package]
+name = "keyoink-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+whoami = "2"
+ureq = { version = "3", features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release.package."*"]
+opt-level = 3
