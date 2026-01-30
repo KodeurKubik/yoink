@@ -1,12 +1,16 @@
 // TODO: replace unwraps with .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-use axum::{Json, Router, http::StatusCode, routing::post};
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::Path,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    sync::{Mutex, OnceLock},
-};
+use std::sync::{Mutex, OnceLock};
+use tokio::{fs::File, io::AsyncWriteExt};
 
 const PATH: &str = "./data";
 const SERVER: &str = "0.0.0.0:1984";
@@ -36,7 +40,9 @@ async fn main() {
         .unwrap();
     }
 
-    let app = Router::new().route("/diff", post(diff));
+    let app = Router::new()
+        .route("/diff/{id}", post(diff))
+        .route("/upload/{id}", post(upload));
 
     let listener = tokio::net::TcpListener::bind(SERVER).await.unwrap();
     println!("Server listening on {SERVER}");
@@ -45,28 +51,32 @@ async fn main() {
 
 //
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 struct DiffReq {
     root: String,
-    username: String,
-    password: String,
-    files: HashMap<String, u64>,
+    files: Vec<(String, u64)>,
 }
 #[derive(Serialize)]
 struct DiffRes {
-    files: HashMap<String, String>,
+    files: Vec<(String, u64, Option<String>)>,
 }
 
-async fn diff(Json(payload): Json<DiffReq>) -> Result<Json<DiffRes>, StatusCode> {
-    if payload.password != PASSWORD {
-        return Err(StatusCode::IM_A_TEAPOT);
+async fn diff(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Json(payload): Json<DiffReq>,
+) -> Result<Json<DiffRes>, StatusCode> {
+    let pwd = headers
+        .get("x-auth")
+        .ok_or(StatusCode::FORBIDDEN)?
+        .to_str()
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+
+    if pwd != PASSWORD {
+        return Err(StatusCode::FORBIDDEN);
     }
 
-    let username: String = payload
-        .username
-        .chars()
-        .filter(|c| c.is_alphabetic())
-        .collect();
+    let username: String = user_id.chars().filter(|c| c.is_alphabetic()).collect();
 
     let oldfiles: Vec<DBFiles> = {
         let db = get_db().lock().unwrap();
@@ -89,17 +99,66 @@ async fn diff(Json(payload): Json<DiffReq>) -> Result<Json<DiffRes>, StatusCode>
 
     println!("Found DB: {oldfiles:?}");
 
-    let mut updates: HashMap<String, String> = HashMap::with_capacity(payload.files.len());
+    let mut updates: Vec<(String, u64, Option<String>)> = Vec::with_capacity(payload.files.len());
 
-    for f in payload.files.keys() {
-        if let Some(found) = oldfiles.iter().find(|d| d.path == *f) {
-            updates.insert(f.to_string(), found.hash.clone());
+    for f in payload.files {
+        if let Some(found) = oldfiles.iter().find(|d| d.path == f.0) {
+            updates.push((f.0, f.1, Some(found.hash.clone())));
         } else {
-            updates.insert(f.to_string(), "".to_string());
+            updates.push((f.0, f.1, None));
         }
     }
+
+    updates.sort_by(|a, b| {
+        if a.2.is_none() && !b.2.is_none() {
+            return std::cmp::Ordering::Less;
+        } else if !a.2.is_none() && b.2.is_none() {
+            return std::cmp::Ordering::Greater;
+        }
+
+        a.1.cmp(&b.1)
+    });
 
     let res = DiffRes { files: updates };
 
     Ok(Json(res))
+}
+
+//
+
+async fn upload(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    body: Bytes,
+) -> Result<(), StatusCode> {
+    let pwd = headers
+        .get("x-auth")
+        .ok_or(StatusCode::FORBIDDEN)?
+        .to_str()
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+
+    if pwd != PASSWORD {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let username: String = user_id.chars().filter(|c| c.is_alphabetic()).collect();
+
+    let base_dir = std::path::Path::new(PATH).join(&username);
+
+    tokio::fs::create_dir_all(&base_dir)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let filepath = base_dir.join("uploaded_file");
+
+    let mut file = File::create(&filepath)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    file.write_all(&body)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Ok(())
+    Err(StatusCode::IM_A_TEAPOT)
 }

@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    fs::{self, File},
+    io::BufReader,
+    path::PathBuf,
+};
 
 const SERVER: &str = "http://localhost:1984";
 const PASSWORD: &str = "hello im a password";
@@ -9,17 +13,16 @@ const UNKNOWN_FILE_SIZE: u64 = 1_000_000_000;
 
 fn main() {
     let username = whoami::username().unwrap_or_else(|_| "unknown".to_string());
-    let mut files: HashMap<String, u64> = HashMap::new();
+    let mut files: Vec<(String, u64)> = Vec::with_capacity(1_000);
     walk_dir(&mut files, PathBuf::from(PATH));
 
     let diff_req = DiffReq {
         root: PATH.to_string(),
-        username: username,
-        password: PASSWORD.to_string(),
         files: files.clone(),
     };
 
-    let diff_res = ureq::post(format!("{SERVER}/diff"))
+    let diff_res = ureq::post(format!("{SERVER}/diff/{username}"))
+        .header("X-Auth", PASSWORD)
         .send_json(diff_req)
         .unwrap()
         .body_mut()
@@ -28,9 +31,25 @@ fn main() {
 
     for f in diff_res.files {
         // f.0 file path, f.1 file hash
-        if files.contains_key(&f.0) {
+        if files.contains(&(f.0.clone(), f.1)) {
             // send file to server
-            println!("Should send: {}", f.0);
+            println!("Sending: {f:?}");
+
+            let file = File::open(&f.0).unwrap();
+
+            let mut reader = BufReader::new(&file);
+            let mut hasher = blake3::Hasher::new();
+            hasher.update_reader(&mut reader).unwrap();
+            let hash = hasher.finalize();
+
+            let response = ureq::post(format!("{SERVER}/upload/{username}"))
+                .header("X-Auth", PASSWORD)
+                .header("X-Path", &f.0)
+                .header("X-Hash", &hash.to_hex().to_string())
+                .header("Content-Type", "application/octet-stream")
+                .send(&file)
+                .unwrap();
+            println!("Response: {response:?}");
         }
     }
 }
@@ -38,16 +57,14 @@ fn main() {
 #[derive(Serialize)]
 struct DiffReq {
     root: String,
-    username: String,
-    password: String,
-    files: HashMap<String, u64>,
+    files: Vec<(String, u64)>,
 }
 #[derive(Deserialize)]
 struct DiffRes {
-    files: HashMap<String, String>,
+    files: Vec<(String, u64, Option<String>)>,
 }
 
-fn walk_dir(files: &mut HashMap<String, u64>, path: PathBuf) {
+fn walk_dir(files: &mut Vec<(String, u64)>, path: PathBuf) {
     let paths = fs::read_dir(path).unwrap();
 
     for path in paths {
@@ -63,7 +80,7 @@ fn walk_dir(files: &mut HashMap<String, u64>, path: PathBuf) {
                         UNKNOWN_FILE_SIZE
                     };
 
-                    files.insert(fpath.to_string_lossy().to_string(), size);
+                    files.push((fpath.to_string_lossy().to_string(), size));
                 } else if ftype.is_dir() {
                     walk_dir(files, fpath);
                 }

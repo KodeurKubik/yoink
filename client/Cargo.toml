@@ -7,6 +7,7 @@ edition = "2024"
 whoami = "2"
 ureq = { version = "3", features = ["json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
+blake3 = "1"
 
 [profile.release]
 opt-level = "s"
