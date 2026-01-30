@@ -1,5 +1,3 @@
-// TODO: replace unwraps with .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
 use axum::{
     Json, Router,
     body::Bytes,
@@ -7,12 +5,20 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::post,
 };
+use path_clean::PathClean;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::sync::{Mutex, OnceLock};
-use tokio::{fs::File, io::AsyncWriteExt};
+use std::{
+    ffi::OsStr,
+    sync::{Mutex, OnceLock},
+};
+use tokio::{
+    fs::{self, File},
+    io::AsyncWriteExt,
+    task,
+};
 
-const PATH: &str = "./data";
+const PATH: &str = "data";
 const SERVER: &str = "0.0.0.0:1984";
 const PASSWORD: &str = "hello im a password";
 
@@ -67,7 +73,7 @@ async fn diff(
     Json(payload): Json<DiffReq>,
 ) -> Result<Json<DiffRes>, StatusCode> {
     let pwd = headers
-        .get("x-auth")
+        .get("X-Auth")
         .ok_or(StatusCode::FORBIDDEN)?
         .to_str()
         .map_err(|_| StatusCode::FORBIDDEN)?;
@@ -79,11 +85,13 @@ async fn diff(
     let username: String = user_id.chars().filter(|c| c.is_alphabetic()).collect();
 
     let oldfiles: Vec<DBFiles> = {
-        let db = get_db().lock().unwrap();
+        let db = get_db()
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let mut stmt = db
             .prepare("SELECT path, hash FROM users WHERE username = ? AND path LIKE ?")
-            .unwrap();
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let u_iter = stmt
             .query_map([&username, &format!("{}%", payload.root)], |row| {
@@ -92,12 +100,12 @@ async fn diff(
                     hash: row.get(1)?,
                 })
             })
-            .unwrap();
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        u_iter.collect::<Result<Vec<_>, _>>().unwrap()
+        u_iter
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
-
-    println!("Found DB: {oldfiles:?}");
 
     let mut updates: Vec<(String, u64, Option<String>)> = Vec::with_capacity(payload.files.len());
 
@@ -130,9 +138,9 @@ async fn upload(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     body: Bytes,
-) -> Result<(), StatusCode> {
+) -> Result<StatusCode, StatusCode> {
     let pwd = headers
-        .get("x-auth")
+        .get("X-Auth")
         .ok_or(StatusCode::FORBIDDEN)?
         .to_str()
         .map_err(|_| StatusCode::FORBIDDEN)?;
@@ -143,14 +151,38 @@ async fn upload(
 
     let username: String = user_id.chars().filter(|c| c.is_alphabetic()).collect();
 
-    let base_dir = std::path::Path::new(PATH).join(&username);
+    // get user input path, check if it doesn't escape
+    let path = String::from_utf8_lossy(
+        headers
+            .get("X-Path")
+            .ok_or(StatusCode::FORBIDDEN)?
+            .as_bytes(),
+    )
+    .to_string();
 
-    tokio::fs::create_dir_all(&base_dir)
+    let base_dir = std::path::Path::new(PATH).join(&username);
+    let filepath = base_dir.join(&path).clean();
+    let filename = filepath
+        .file_name()
+        .unwrap_or(OsStr::new("unknown"))
+        .to_string_lossy()
+        .to_string();
+
+    if !filepath.starts_with(&base_dir) {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // if its a folder, stop
+    if filepath.is_dir() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // create parent dir
+    fs::create_dir_all(&filepath.parent().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let filepath = base_dir.join("uploaded_file");
-
+    // save file
     let mut file = File::create(&filepath)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -159,6 +191,43 @@ async fn upload(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Ok(())
-    Err(StatusCode::IM_A_TEAPOT)
+    // verify hash
+    let xhash = headers
+        .get("X-Hash")
+        .ok_or(StatusCode::FORBIDDEN)?
+        .to_str()
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+
+    let hash = task::spawn_blocking(move || {
+        let file = std::fs::File::open(&filepath)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_reader(&mut reader)?;
+        Ok::<_, std::io::Error>(hasher.finalize())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .to_hex()
+    .to_string();
+
+    // save to db
+    {
+        let db = get_db().lock().unwrap();
+
+        db.execute(
+            "INSERT INTO users (username, path, hash) VALUES(?, ?, ?) ON CONFLICT(username, path) DO UPDATE SET hash=?;",
+            (&username, &path, &hash, &hash),
+        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    if hash != xhash {
+        // uh oh
+        // tbh idk what to do, lets just keep file and send specific error to client
+        return Err(StatusCode::REQUEST_TIMEOUT);
+    }
+
+    println!("Successfully uploaded {filename} for user {username}");
+
+    Ok(StatusCode::OK)
 }

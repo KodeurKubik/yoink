@@ -33,23 +33,25 @@ fn main() {
         // f.0 file path, f.1 file hash
         if files.contains(&(f.0.clone(), f.1)) {
             // send file to server
-            println!("Sending: {f:?}");
-
             let file = File::open(&f.0).unwrap();
-
             let mut reader = BufReader::new(&file);
             let mut hasher = blake3::Hasher::new();
             hasher.update_reader(&mut reader).unwrap();
-            let hash = hasher.finalize();
+            let hash = hasher.finalize().to_hex().to_string();
 
-            let response = ureq::post(format!("{SERVER}/upload/{username}"))
+            if let Some(xhash) = &f.2
+                && xhash == &hash
+            {
+                continue;
+            }
+
+            let file_to_send = File::open(&f.0).unwrap();
+            let _response = ureq::post(format!("{SERVER}/upload/{username}"))
                 .header("X-Auth", PASSWORD)
                 .header("X-Path", &f.0)
-                .header("X-Hash", &hash.to_hex().to_string())
+                .header("X-Hash", &hash)
                 .header("Content-Type", "application/octet-stream")
-                .send(&file)
-                .unwrap();
-            println!("Response: {response:?}");
+                .send(file_to_send);
         }
     }
 }
