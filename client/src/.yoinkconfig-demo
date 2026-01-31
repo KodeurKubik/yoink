@@ -1,0 +1,12 @@
+# This file defines the config of the CLIENT executable
+# If you change it, you have to re-compile the program
+
+# SERVER can be http or https, no trailing slash!
+SERVER=http://localhost:1984
+
+# USERNAME and PASSWORD i guess
+USERNAME=demoguy
+PASSWORD=woohoo am a passwooorddd
+
+# the PATHs of savings™ (split using ','), prefer absolute
+PATH=./test

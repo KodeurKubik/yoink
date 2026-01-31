@@ -1,0 +1,5 @@
+# This file defines the config of the SERVER executable
+# If you change it, you have to re-compile the program
+
+# SERVER is the listen address of the server, with the port
+SERVER=0.0.0.0:1984

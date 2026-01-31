@@ -2,4 +2,9 @@ target
 .DS_Store
 
 /client/test/
+/client/src/.yoinkconfig
+
 /server/data/
+/server/src/.yoinkconfig
+/server/.yoinkignore
+/server/.yoinkpass

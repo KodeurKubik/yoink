@@ -1,28 +1,54 @@
+// dont open any window on windows
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File},
+    collections::HashMap,
+    fs::{File, read_dir},
     io::BufReader,
     path::PathBuf,
 };
 
-const SERVER: &str = "http://localhost:1984";
-const PASSWORD: &str = "hello im a password";
-
-const PATH: &str = "./test";
+const YOINK_CONFIG_FILE: &str = include_str!(".yoinkconfig");
 const UNKNOWN_FILE_SIZE: u64 = 1_000_000_000;
 
 fn main() {
-    let username = whoami::username().unwrap_or_else(|_| "unknown".to_string());
+    let mut yoink_config: HashMap<String, String> = HashMap::with_capacity(4);
+
+    for conf in YOINK_CONFIG_FILE
+        .split("\n")
+        .filter(|e| !e.is_empty() && !e.starts_with("#"))
+        .map(|e| e.to_string())
+    {
+        if let Some(vals) = conf.split_once("=") {
+            yoink_config.insert(vals.0.to_string(), vals.1.to_string());
+        }
+    }
+
+    let server = yoink_config.get("SERVER").unwrap().to_string();
+    let password = yoink_config.get("PASSWORD").unwrap().to_string();
+    let path = yoink_config.get("PATH").unwrap().to_string();
+    let username = yoink_config
+        .get("USERNAME")
+        .unwrap_or(&"unknown".to_string())
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>();
+
     let mut files: Vec<(String, u64)> = Vec::with_capacity(1_000);
-    walk_dir(&mut files, PathBuf::from(PATH));
+    walk_dir(&mut files, PathBuf::from(&path));
 
     let diff_req = DiffReq {
-        root: PATH.to_string(),
+        root: path,
         files: files.clone(),
     };
 
-    let diff_res = ureq::post(format!("{SERVER}/diff/{username}"))
-        .header("X-Auth", PASSWORD)
+    let diff_res = ureq::post(format!("{server}/diff/{username}"))
+        .header("User-Agent", "YoinkSync/0.1")
+        .header("X-Auth", &password)
         .send_json(diff_req)
         .unwrap()
         .body_mut()
@@ -46,8 +72,9 @@ fn main() {
             }
 
             let file_to_send = File::open(&f.0).unwrap();
-            let _response = ureq::post(format!("{SERVER}/upload/{username}"))
-                .header("X-Auth", PASSWORD)
+            let _response = ureq::post(format!("{server}/upload/{username}"))
+                .header("User-Agent", "YoinkSync/0.1")
+                .header("X-Auth", &password)
                 .header("X-Path", &f.0)
                 .header("X-Hash", &hash)
                 .header("Content-Type", "application/octet-stream")
@@ -67,7 +94,7 @@ struct DiffRes {
 }
 
 fn walk_dir(files: &mut Vec<(String, u64)>, path: PathBuf) {
-    let paths = fs::read_dir(path).unwrap();
+    let paths = read_dir(path).unwrap();
 
     for path in paths {
         if let Ok(path) = path {

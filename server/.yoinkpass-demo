@@ -1,0 +1,9 @@
+# This file configures the passwords that can be used to access the server
+# There can be "global password" and "per user passwords"
+# A global password is written like this:
+im a password hello
+
+# WARNING: Usernames must be 'a-Z' with NO SPACES
+# Whereas a user password looks like this:
+username: hello there im a password v2
+demoguy: woohoo am a passwooorddd

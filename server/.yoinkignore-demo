@@ -1,0 +1,9 @@
+# The goal of this file is to avoid transfering HELL folders like:
+# node_modules, cargo's target, dist, builds, and so on
+# One line per ignore, like a .gitignore, but it will only ignore
+# if the TOTAL path CONTAINS your string
+/node_modules/
+/target/
+
+# If the entry starts with a *, it will check if the path ENDS WITH
+*/.DS_Store

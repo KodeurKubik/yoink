@@ -1,16 +1,19 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::Path,
+    extract::{Path, Request},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::post,
 };
 use path_clean::PathClean;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     ffi::OsStr,
-    sync::{Mutex, OnceLock},
+    sync::{LazyLock, Mutex, OnceLock},
 };
 use tokio::{
     fs::{self, File},
@@ -18,9 +21,27 @@ use tokio::{
     task,
 };
 
+const YOINK_CONFIG_FILE: &str = include_str!(".yoinkconfig");
 const PATH: &str = "data";
-const SERVER: &str = "0.0.0.0:1984";
-const PASSWORD: &str = "hello im a password";
+
+// dude idk why this is so long lol
+static YOINK_IGNORE: LazyLock<Vec<String>> = LazyLock::new(|| {
+    std::fs::read_to_string(".yoinkignore")
+        .unwrap_or("".to_string())
+        .split("\n")
+        .filter(|e| !e.is_empty() && !e.starts_with("#"))
+        .map(|e| e.to_string())
+        .collect()
+});
+
+static YOINK_PASS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    std::fs::read_to_string(".yoinkpass")
+        .unwrap_or("".to_string())
+        .split("\n")
+        .filter(|e| !e.is_empty() && !e.starts_with("#"))
+        .map(|e| e.to_string())
+        .collect()
+});
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 pub fn get_db() -> &'static Mutex<Connection> {
@@ -37,6 +58,20 @@ struct DBFiles {
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let mut yoink_config: HashMap<String, String> = HashMap::with_capacity(2);
+
+    for conf in YOINK_CONFIG_FILE
+        .split("\n")
+        .filter(|e| !e.is_empty() && !e.starts_with("#"))
+        .map(|e| e.to_string())
+    {
+        if let Some(vals) = conf.split_once("=") {
+            yoink_config.insert(vals.0.to_string(), vals.1.to_string());
+        }
+    }
+
+    let server = yoink_config.get("SERVER").unwrap().to_string();
+
     {
         let db = get_db().lock().unwrap();
 
@@ -48,10 +83,11 @@ async fn main() {
 
     let app = Router::new()
         .route("/diff/{id}", post(diff))
-        .route("/upload/{id}", post(upload));
+        .route("/upload/{id}", post(upload))
+        .route_layer(middleware::from_fn(auth));
 
-    let listener = tokio::net::TcpListener::bind(SERVER).await.unwrap();
-    println!("Server listening on {SERVER}");
+    let listener = tokio::net::TcpListener::bind(&server).await.unwrap();
+    println!("Server listening on {server}");
     let _ = axum::serve(listener, app).await;
 }
 
@@ -68,21 +104,13 @@ struct DiffRes {
 }
 
 async fn diff(
-    headers: HeaderMap,
     Path(user_id): Path<String>,
     Json(payload): Json<DiffReq>,
 ) -> Result<Json<DiffRes>, StatusCode> {
-    let pwd = headers
-        .get("X-Auth")
-        .ok_or(StatusCode::FORBIDDEN)?
-        .to_str()
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-
-    if pwd != PASSWORD {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    let username: String = user_id.chars().filter(|c| c.is_alphabetic()).collect();
+    let username: String = user_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
 
     let oldfiles: Vec<DBFiles> = {
         let db = get_db()
@@ -90,7 +118,7 @@ async fn diff(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let mut stmt = db
-            .prepare("SELECT path, hash FROM users WHERE username = ? AND path LIKE ?")
+            .prepare("SELECT path, hash FROM users WHERE username = ? AND path LIKE ?;")
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let u_iter = stmt
@@ -110,10 +138,18 @@ async fn diff(
     let mut updates: Vec<(String, u64, Option<String>)> = Vec::with_capacity(payload.files.len());
 
     for f in payload.files {
-        if let Some(found) = oldfiles.iter().find(|d| d.path == f.0) {
-            updates.push((f.0, f.1, Some(found.hash.clone())));
-        } else {
-            updates.push((f.0, f.1, None));
+        if !YOINK_IGNORE.iter().any(|ig| {
+            if ig.starts_with("*") {
+                f.0.ends_with(ig)
+            } else {
+                f.0.contains(ig)
+            }
+        }) {
+            if let Some(found) = oldfiles.iter().find(|d| d.path == f.0) {
+                updates.push((f.0, f.1, Some(found.hash.clone())));
+            } else {
+                updates.push((f.0, f.1, None));
+            }
         }
     }
 
@@ -139,17 +175,10 @@ async fn upload(
     Path(user_id): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    let pwd = headers
-        .get("X-Auth")
-        .ok_or(StatusCode::FORBIDDEN)?
-        .to_str()
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-
-    if pwd != PASSWORD {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    let username: String = user_id.chars().filter(|c| c.is_alphabetic()).collect();
+    let username: String = user_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
 
     // get user input path, check if it doesn't escape
     let path = String::from_utf8_lossy(
@@ -230,4 +259,39 @@ async fn upload(
     println!("Successfully uploaded {filename} for user {username}");
 
     Ok(StatusCode::OK)
+}
+
+//
+
+async fn auth(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let xpwd = headers
+        .get("X-Auth")
+        .ok_or(StatusCode::UNAUTHORIZED)?
+        .to_str()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let username: String = user_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+
+    let valid = YOINK_PASS.iter().any(|pwd| {
+        if let Some(u_pwd) = pwd.split_once(": ") {
+            return u_pwd.0 == &username && u_pwd.1 == xpwd;
+        } else {
+            return pwd == xpwd;
+        }
+    });
+
+    if !valid {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let response = next.run(request).await;
+    Ok(response)
 }
