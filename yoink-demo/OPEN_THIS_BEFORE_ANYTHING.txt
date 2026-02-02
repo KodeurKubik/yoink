@@ -1,0 +1,17 @@
+Hi! Welcome to the Yoink demo!
+
+BEFORE ANYTHING READ THESE INSTRUCTIONS!!!
+
+---
+
+You'll have to open the server first and then the client. For this:
+
+1. Open the `yoink-server-` with your OS at the end first
+2. Open the `yoink-client-` with your OS at the end next
+
+that's it actually... lol
+
+---
+
+the project may seem quite simple at first, but consider taking a look at the code :)
+100% written by human :pp (not even autocomplete)

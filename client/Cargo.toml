@@ -1,5 +1,5 @@
 [package]
-name = "keyoink-client"
+name = "yoink-client"
 version = "0.1.0"
 edition = "2024"
 
@@ -17,3 +17,7 @@ panic = "abort"
 
 [profile.release.package."*"]
 opt-level = 3
+
+[features]
+default = ["relative"]
+relative = []

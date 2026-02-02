@@ -19,6 +19,17 @@ const MAX_PATH_NOT_AVAILABLE_RETRIES: usize = 15;
 const PATH_NOT_AVAILABLE_DELAY: Duration = Duration::from_secs(2);
 
 fn main() {
+    #[cfg(feature = "relative")]
+    {
+        let exe_path = std::env::current_exe().expect("Failed to get current executable path");
+
+        let exe_dir = exe_path
+            .parent()
+            .expect("Failed to get executable directory");
+
+        std::env::set_current_dir(exe_dir).expect("Failed to change working directory");
+    }
+
     let mut yoink_config: HashMap<String, String> = HashMap::with_capacity(4);
 
     for conf in YOINK_CONFIG_FILE

@@ -1,7 +1,16 @@
 target
 .DS_Store
+.*-save
 
-/client/test/
+my-build/
+my-build.sh
+
+yoink-demo.zip
+/yoink-demo/yoink-*
+/yoink-demo/.yoinkignore
+/yoink-demo/.yoinkpass
+
+/client/this_folder_will_be_sent/
 /client/src/.yoinkconfig
 
 /server/data/

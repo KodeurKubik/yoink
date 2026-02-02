@@ -9,4 +9,4 @@ USERNAME=demoguy
 PASSWORD=woohoo am a passwooorddd
 
 # the PATHs of savings™ (split using ','), prefer absolute
-PATH=./test
+PATH=./this_folder_will_be_sent

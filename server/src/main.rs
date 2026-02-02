@@ -61,6 +61,17 @@ struct DBFiles {
 
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "relative")]
+    {
+        let exe_path = std::env::current_exe().expect("Failed to get current executable path");
+
+        let exe_dir = exe_path
+            .parent()
+            .expect("Failed to get executable directory");
+
+        std::env::set_current_dir(exe_dir).expect("Failed to change working directory");
+    }
+
     tracing_subscriber::fmt::init();
 
     fs::create_dir_all(PATH).await.unwrap();
