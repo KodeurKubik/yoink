@@ -10,7 +10,9 @@ Synchronize a folder over to a distant server. It’s basically a git but overki
 
 ## Demo:
 
-(will upload soon)
+
+https://github.com/user-attachments/assets/856f4d77-71b0-4e0f-b186-614a9dd84a64
+
 
 ## Use yourself
 
