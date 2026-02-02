@@ -3,3 +3,6 @@
 
 # SERVER is the listen address of the server, with the port
 SERVER=0.0.0.0:1984
+
+# Allow users to delete their files
+ALLOW_DELETION=true

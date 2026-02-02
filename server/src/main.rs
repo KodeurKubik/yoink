@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, Request},
+    extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -48,6 +48,11 @@ pub fn get_db() -> &'static Mutex<Connection> {
     DB.get_or_init(|| Mutex::new(Connection::open(format!("{PATH}/db.sqlite")).unwrap()))
 }
 
+#[derive(Clone)]
+struct AppState {
+    allow_deletion: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct DBFiles {
     path: String,
@@ -57,6 +62,8 @@ struct DBFiles {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    fs::create_dir_all(PATH).await.unwrap();
 
     let mut yoink_config: HashMap<String, String> = HashMap::with_capacity(2);
 
@@ -71,6 +78,10 @@ async fn main() {
     }
 
     let server = yoink_config.get("SERVER").unwrap().to_string();
+    let allow_deletion = yoink_config
+        .get("ALLOW_DELETION")
+        .unwrap_or(&"false".to_string())
+        == "true";
 
     {
         let db = get_db().lock().unwrap();
@@ -81,10 +92,19 @@ async fn main() {
         .unwrap();
     }
 
-    let app = Router::new()
-        .route("/diff/{id}", post(diff))
-        .route("/upload/{id}", post(upload))
-        .route_layer(middleware::from_fn(auth));
+    let state = AppState { allow_deletion };
+
+    let app = {
+        let mut tmp = Router::new()
+            .route("/diff/{id}", post(diff))
+            .route("/upload/{id}", post(upload));
+
+        if allow_deletion {
+            tmp = tmp.route("/delete/{id}", post(deleter));
+        }
+
+        tmp.route_layer(middleware::from_fn(auth)).with_state(state)
+    };
 
     let listener = tokio::net::TcpListener::bind(&server).await.unwrap();
     println!("Server listening on {server}");
@@ -100,10 +120,12 @@ struct DiffReq {
 }
 #[derive(Serialize)]
 struct DiffRes {
+    allow_deletion: bool,
     files: Vec<(String, u64, Option<String>)>,
 }
 
 async fn diff(
+    State(state): State<AppState>,
     Path(user_id): Path<String>,
     Json(payload): Json<DiffReq>,
 ) -> Result<Json<DiffRes>, StatusCode> {
@@ -135,7 +157,20 @@ async fn diff(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
 
-    let mut updates: Vec<(String, u64, Option<String>)> = Vec::with_capacity(payload.files.len());
+    let mut updates: Vec<(String, u64, Option<String>)> =
+        Vec::with_capacity(if state.allow_deletion {
+            payload.files.len() + oldfiles.len()
+        } else {
+            payload.files.len()
+        });
+
+    if state.allow_deletion == true {
+        for fi in &oldfiles {
+            if !payload.files.iter().any(|f| f.0 == fi.path) {
+                updates.push((fi.path.clone(), 0u64, Some(fi.hash.clone())));
+            }
+        }
+    }
 
     for f in payload.files {
         if !YOINK_IGNORE.iter().any(|ig| {
@@ -163,7 +198,12 @@ async fn diff(
         a.1.cmp(&b.1)
     });
 
-    let res = DiffRes { files: updates };
+    let res = DiffRes {
+        allow_deletion: state.allow_deletion,
+        files: updates,
+    };
+
+    println!("Diff request by {username}");
 
     Ok(Json(res))
 }
@@ -187,7 +227,9 @@ async fn upload(
             .ok_or(StatusCode::FORBIDDEN)?
             .as_bytes(),
     )
-    .to_string();
+    .to_string()
+    .replace(':', "")
+    .replace('\\', "/");
 
     let base_dir = std::path::Path::new(PATH).join(&username);
     let filepath = base_dir.join(&path).clean();
@@ -263,6 +305,66 @@ async fn upload(
 
 //
 
+#[derive(Deserialize)]
+struct DeleteReq {
+    files: Vec<String>,
+}
+
+async fn deleter(
+    Path(user_id): Path<String>,
+    Json(payload): Json<DeleteReq>,
+) -> Result<StatusCode, StatusCode> {
+    let username: String = user_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+
+    let base_dir = std::path::Path::new(PATH).join(&username);
+
+    for path in payload
+        .files
+        .iter()
+        .map(|p| p.replace(':', "").replace('\\', "/"))
+    {
+        let filepath = base_dir.join(&path).clean();
+        let filename = filepath
+            .file_name()
+            .unwrap_or(OsStr::new("unknown"))
+            .to_string_lossy()
+            .to_string();
+
+        if !filepath.starts_with(&base_dir) {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        // if its a folder, stop
+        if filepath.is_dir() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        delete_element(&filepath)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        {
+            let db = get_db().lock().unwrap();
+
+            // save to db
+            db.execute(
+                "DELETE FROM users WHERE username=? AND path=?;",
+                (&username, &path),
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+
+        println!("Successfully deleted {filename} for user {username}");
+    }
+
+    Ok(StatusCode::OK)
+}
+
+//
+
 async fn auth(
     headers: HeaderMap,
     Path(user_id): Path<String>,
@@ -294,4 +396,46 @@ async fn auth(
 
     let response = next.run(request).await;
     Ok(response)
+}
+
+//
+
+async fn delete_element(filepath: &std::path::PathBuf) -> tokio::io::Result<()> {
+    let mut anc = filepath.ancestors();
+    let mut last: Option<&std::path::Path> = None;
+    let mut prev_name = filepath.file_name();
+
+    loop {
+        if let Some(got) = anc.next() {
+            if got.is_dir() {
+                let mut read = fs::read_dir(&got).await?;
+
+                let first_ent = read.next_entry().await?;
+                let empty = {
+                    if let Some(ent) = first_ent {
+                        Some(ent.file_name().as_os_str()) == prev_name
+                            && read.next_entry().await?.is_none()
+                    } else {
+                        false
+                    }
+                };
+
+                if empty {
+                    last = Some(got);
+                    prev_name = got.file_name();
+                } else {
+                    if let Some(path) = last {
+                        // delete n-th parent folder
+                        fs::remove_dir_all(path).await?;
+                    } else {
+                        // delete file
+                        fs::remove_file(&filepath).await?;
+                    }
+                    return Ok(());
+                }
+            }
+        } else {
+            return Ok(());
+        }
+    }
 }

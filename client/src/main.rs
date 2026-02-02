@@ -7,13 +7,16 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::{File, read_dir},
+    fs::{File, exists, read_dir},
     io::BufReader,
     path::PathBuf,
+    time::Duration,
 };
 
 const YOINK_CONFIG_FILE: &str = include_str!(".yoinkconfig");
 const UNKNOWN_FILE_SIZE: u64 = 1_000_000_000;
+const MAX_PATH_NOT_AVAILABLE_RETRIES: usize = 15;
+const PATH_NOT_AVAILABLE_DELAY: Duration = Duration::from_secs(2);
 
 fn main() {
     let mut yoink_config: HashMap<String, String> = HashMap::with_capacity(4);
@@ -30,7 +33,12 @@ fn main() {
 
     let server = yoink_config.get("SERVER").unwrap().to_string();
     let password = yoink_config.get("PASSWORD").unwrap().to_string();
-    let path = yoink_config.get("PATH").unwrap().to_string();
+    let mut paths = yoink_config
+        .get("PATH")
+        .unwrap()
+        .split(",")
+        .map(|e| e.to_string())
+        .collect::<Vec<String>>();
     let username = yoink_config
         .get("USERNAME")
         .unwrap_or(&"unknown".to_string())
@@ -38,48 +46,81 @@ fn main() {
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>();
 
-    let mut files: Vec<(String, u64)> = Vec::with_capacity(1_000);
-    walk_dir(&mut files, PathBuf::from(&path));
+    let mut del: Vec<String> = Vec::new();
+    let mut waitlist: Vec<String> = Vec::with_capacity(paths.len());
+    let mut retries: usize = 0;
 
-    let diff_req = DiffReq {
-        root: path,
-        files: files.clone(),
-    };
-
-    let diff_res = ureq::post(format!("{server}/diff/{username}"))
-        .header("User-Agent", "YoinkSync/0.1")
-        .header("X-Auth", &password)
-        .send_json(diff_req)
-        .unwrap()
-        .body_mut()
-        .read_json::<DiffRes>()
-        .unwrap();
-
-    for f in diff_res.files {
-        // f.0 file path, f.1 file hash
-        if files.contains(&(f.0.clone(), f.1)) {
-            // send file to server
-            let file = File::open(&f.0).unwrap();
-            let mut reader = BufReader::new(&file);
-            let mut hasher = blake3::Hasher::new();
-            hasher.update_reader(&mut reader).unwrap();
-            let hash = hasher.finalize().to_hex().to_string();
-
-            if let Some(xhash) = &f.2
-                && xhash == &hash
-            {
-                continue;
+    while let Some(path) = paths.pop() {
+        match exists(&path) {
+            Ok(false) => {
+                waitlist.push(path);
             }
+            Ok(true) => {
+                let mut files: Vec<(String, u64)> = Vec::with_capacity(1_000);
+                walk_dir(&mut files, PathBuf::from(&path));
 
-            let file_to_send = File::open(&f.0).unwrap();
-            let _response = ureq::post(format!("{server}/upload/{username}"))
-                .header("User-Agent", "YoinkSync/0.1")
-                .header("X-Auth", &password)
-                .header("X-Path", &f.0)
-                .header("X-Hash", &hash)
-                .header("Content-Type", "application/octet-stream")
-                .send(file_to_send);
+                let diff_req = DiffReq {
+                    root: path,
+                    files: files.clone(),
+                };
+
+                let diff_res = ureq::post(format!("{server}/diff/{username}"))
+                    .header("User-Agent", "YoinkSync/0.1")
+                    .header("X-Auth", &password)
+                    .send_json(diff_req)
+                    .unwrap()
+                    .body_mut()
+                    .read_json::<DiffRes>()
+                    .unwrap();
+
+                for f in diff_res.files {
+                    // f.0 file path, f.1 file hash
+                    if files.contains(&(f.0.clone(), f.1)) {
+                        // send file to server
+                        let file = File::open(&f.0).unwrap();
+                        let mut reader = BufReader::new(&file);
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update_reader(&mut reader).unwrap();
+                        let hash = hasher.finalize().to_hex().to_string();
+
+                        if let Some(xhash) = &f.2
+                            && xhash == &hash
+                        {
+                            continue;
+                        }
+
+                        let file_to_send = File::open(&f.0).unwrap();
+                        let _response = ureq::post(format!("{server}/upload/{username}"))
+                            .header("User-Agent", "YoinkSync/0.1")
+                            .header("X-Auth", &password)
+                            .header("X-Path", &f.0)
+                            .header("X-Hash", &hash)
+                            .header("Content-Type", "application/octet-stream")
+                            .send(file_to_send);
+                    } else if diff_res.allow_deletion {
+                        del.push(f.0);
+                    }
+                }
+            }
+            _ => {}
         }
+
+        if waitlist.len() > 0 && paths.len() == 0 && retries < MAX_PATH_NOT_AVAILABLE_RETRIES {
+            retries += 1;
+            std::thread::sleep(PATH_NOT_AVAILABLE_DELAY);
+            paths = waitlist;
+            waitlist = Vec::with_capacity(paths.len());
+        }
+    }
+
+    if del.len() > 0 {
+        let delete_req = DeleteReq { files: del };
+
+        let _delete_res = ureq::post(format!("{server}/delete/{username}"))
+            .header("User-Agent", "YoinkSync/0.1")
+            .header("X-Auth", &password)
+            .send_json(delete_req)
+            .unwrap();
     }
 }
 
@@ -88,13 +129,26 @@ struct DiffReq {
     root: String,
     files: Vec<(String, u64)>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct DiffRes {
+    allow_deletion: bool,
     files: Vec<(String, u64, Option<String>)>,
 }
 
+#[derive(Serialize)]
+struct DeleteReq {
+    files: Vec<String>,
+}
+
 fn walk_dir(files: &mut Vec<(String, u64)>, path: PathBuf) {
-    let paths = read_dir(path).unwrap();
+    let paths = read_dir(&path).unwrap();
+
+    if let Ok(exi) = exists(path.join(".noyoink"))
+        && exi
+    {
+        // ignore folders containing a .noyoink
+        return;
+    }
 
     for path in paths {
         if let Ok(path) = path {
