@@ -4,22 +4,25 @@
     windows_subsystem = "windows"
 )]
 
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs::{File, exists, read_dir},
     io::BufReader,
     path::PathBuf,
+    sync::Mutex,
     time::Duration,
 };
 
 const YOINK_CONFIG_FILE: &str = include_str!(".yoinkconfig");
 const UNKNOWN_FILE_SIZE: u64 = 1_000_000_000;
 const MAX_PATH_NOT_AVAILABLE_RETRIES: usize = 15;
+const MULTI_THREAD_COUNT: usize = 5;
 const PATH_NOT_AVAILABLE_DELAY: Duration = Duration::from_secs(2);
 
 fn main() {
-    #[cfg(feature = "relative")]
+    #[cfg(all(feature = "relative", not(debug_assertions)))]
     {
         let exe_path = std::env::current_exe().expect("Failed to get current executable path");
 
@@ -57,9 +60,15 @@ fn main() {
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>();
 
-    let mut del: Vec<String> = Vec::new();
     let mut waitlist: Vec<String> = Vec::with_capacity(paths.len());
     let mut retries: usize = 0;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(MULTI_THREAD_COUNT)
+        .build()
+        .unwrap();
+
+    let mut del: Vec<String> = Vec::new();
 
     while let Some(path) = paths.pop() {
         match exists(&path) {
@@ -84,34 +93,44 @@ fn main() {
                     .read_json::<DiffRes>()
                     .unwrap();
 
-                for f in diff_res.files {
-                    // f.0 file path, f.1 file hash
-                    if files.contains(&(f.0.clone(), f.1)) {
-                        // send file to server
-                        let file = File::open(&f.0).unwrap();
-                        let mut reader = BufReader::new(&file);
-                        let mut hasher = blake3::Hasher::new();
-                        hasher.update_reader(&mut reader).unwrap();
-                        let hash = hasher.finalize().to_hex().to_string();
+                let del_temp: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-                        if let Some(xhash) = &f.2
-                            && xhash == &hash
-                        {
-                            continue;
+                pool.install(|| {
+                    diff_res.files.into_par_iter().for_each(|f| {
+                        // f.0 file path, f.1 file hash
+                        if files.contains(&(f.0.clone(), f.1)) {
+                            // send file to server
+                            let file = File::open(&f.0).unwrap();
+                            let mut reader = BufReader::new(&file);
+                            let mut hasher = blake3::Hasher::new();
+                            hasher.update_reader(&mut reader).unwrap();
+                            let hash = hasher.finalize().to_hex().to_string();
+
+                            if let Some(xhash) = &f.2
+                                && xhash == &hash
+                            {
+                                return;
+                            }
+
+                            let file_to_send = File::open(&f.0).unwrap();
+
+                            if let Err(oh_no) = ureq::post(format!("{server}/upload/{username}"))
+                                .header("User-Agent", "YoinkSync/0.1")
+                                .header("X-Auth", &password)
+                                .header("X-Path", &f.0)
+                                .header("X-Hash", &hash)
+                                .header("Content-Type", "application/octet-stream")
+                                .send(&file_to_send)
+                            {
+                                eprintln!("An error occured: {oh_no:?}");
+                            }
+                        } else if diff_res.allow_deletion {
+                            del_temp.lock().unwrap().push(f.0);
                         }
+                    });
+                });
 
-                        let file_to_send = File::open(&f.0).unwrap();
-                        let _response = ureq::post(format!("{server}/upload/{username}"))
-                            .header("User-Agent", "YoinkSync/0.1")
-                            .header("X-Auth", &password)
-                            .header("X-Path", &f.0)
-                            .header("X-Hash", &hash)
-                            .header("Content-Type", "application/octet-stream")
-                            .send(file_to_send);
-                    } else if diff_res.allow_deletion {
-                        del.push(f.0);
-                    }
-                }
+                del.append(&mut del_temp.into_inner().unwrap());
             }
             _ => {}
         }

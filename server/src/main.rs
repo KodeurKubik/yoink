@@ -1,12 +1,13 @@
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{Path, Request, State},
+    body::Body,
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::Response,
     routing::post,
 };
+use futures_util::StreamExt;
 use path_clean::PathClean;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,7 @@ use tokio::{
 
 const YOINK_CONFIG_FILE: &str = include_str!(".yoinkconfig");
 const PATH: &str = "data";
+const MAX_BODY_SIZE: usize = 1_000_000_000;
 
 // dude idk why this is so long lol
 static YOINK_IGNORE: LazyLock<Vec<String>> = LazyLock::new(|| {
@@ -61,7 +63,7 @@ struct DBFiles {
 
 #[tokio::main]
 async fn main() {
-    #[cfg(feature = "relative")]
+    #[cfg(all(feature = "relative", not(debug_assertions)))]
     {
         let exe_path = std::env::current_exe().expect("Failed to get current executable path");
 
@@ -107,6 +109,7 @@ async fn main() {
 
     let app = {
         let mut tmp = Router::new()
+            .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
             .route("/diff/{id}", post(diff))
             .route("/upload/{id}", post(upload));
 
@@ -224,7 +227,7 @@ async fn diff(
 async fn upload(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    body: Bytes,
+    body: Body,
 ) -> Result<StatusCode, StatusCode> {
     let username: String = user_id
         .chars()
@@ -269,9 +272,16 @@ async fn upload(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    file.write_all(&body)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut stream = body.into_data_stream();
+    let mut hasher = blake3::Hasher::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
 
     // verify hash
     let xhash = headers

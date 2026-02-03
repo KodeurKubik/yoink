@@ -12,10 +12,11 @@ serde_json = "1"
 path-clean = "1"
 blake3 = "1"
 tracing-subscriber = "0.3"
+futures-util = "0.3"
 
 [profile.release]
-opt-level = "s"
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"

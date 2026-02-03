@@ -10,9 +10,7 @@ Synchronize a folder over to a distant server. It’s basically a git but overki
 
 ## Demo:
 
-
 https://github.com/user-attachments/assets/856f4d77-71b0-4e0f-b186-614a9dd84a64
-
 
 ## Use yourself
 
@@ -21,14 +19,16 @@ You should first rename and fill all files called `.something-demo` with 'someth
 Then you can build and run the server with
 
 ```sh
-cd server && cargo run --release
+cd server && cargo run
 ```
 
 And the client with
 
 ```sh
-cd client && cargo run --release
+cd client && cargo run
 ```
+
+For release builds, you should first `build --release` and then move the executable to somewhere. The `data` folder of the server will end up in the same folder as the executable.
 
 ### License
 
