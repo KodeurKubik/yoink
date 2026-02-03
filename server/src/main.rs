@@ -186,9 +186,9 @@ async fn diff(
     for f in payload.files {
         if !YOINK_IGNORE.iter().any(|ig| {
             if ig.starts_with("*") {
-                f.0.ends_with(ig)
+                f.0.replace('\\', "/").ends_with(ig)
             } else {
-                f.0.contains(ig)
+                f.0.replace('\\', "/").contains(ig)
             }
         }) {
             if let Some(found) = oldfiles.iter().find(|d| d.path == f.0) {
