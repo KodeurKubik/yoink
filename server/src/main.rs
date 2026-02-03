@@ -19,7 +19,6 @@ use std::{
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
-    task,
 };
 
 const YOINK_CONFIG_FILE: &str = include_str!(".yoinkconfig");
@@ -290,18 +289,7 @@ async fn upload(
         .to_str()
         .map_err(|_| StatusCode::FORBIDDEN)?;
 
-    let hash = task::spawn_blocking(move || {
-        let file = std::fs::File::open(&filepath)?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut hasher = blake3::Hasher::new();
-        hasher.update_reader(&mut reader)?;
-        Ok::<_, std::io::Error>(hasher.finalize())
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .to_hex()
-    .to_string();
+    let hash = hasher.finalize().to_hex().to_string();
 
     // save to db
     {
