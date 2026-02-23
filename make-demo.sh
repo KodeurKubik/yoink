@@ -25,7 +25,7 @@ cp src/.yoinkconfig-demo src/.yoinkconfig
 
 cargo build --release
 cp ./target/release/yoink-server ../yoink-demo/yoink-server-mac
-upx --best --lzma ../yoink-demo/yoink-server-mac
+# upx --best --lzma ../yoink-demo/yoink-server-mac
 cargo build --release --target x86_64-pc-windows-gnu
 cp ./target/x86_64-pc-windows-gnu/release/yoink-server.exe ../yoink-demo/yoink-server-win.exe
 upx --best --lzma ../yoink-demo/yoink-server-win.exe
@@ -50,7 +50,7 @@ cp src/.yoinkconfig-demo src/.yoinkconfig
 
 cargo build --release
 cp ./target/release/yoink-client ../yoink-demo/yoink-client-mac
-upx --best --lzma ../yoink-demo/yoink-client-mac
+# upx --best --lzma ../yoink-demo/yoink-client-mac
 cargo build --release --target x86_64-pc-windows-gnu
 cp ./target/x86_64-pc-windows-gnu/release/yoink-client.exe ../yoink-demo/yoink-client-win.exe
 upx --best --lzma ../yoink-demo/yoink-client-win.exe

@@ -148,15 +148,20 @@ fn main() {
                 #[cfg(feature = "log")]
                 println!("Got {} files to diff", files.len());
 
-                let diff_res_raw = client
+                let response = client
                     .post(format!("{server}/diff/{username}"))
                     .headers(headers.clone())
+                    .header("Content-Type", "application/json")
                     .body(diff_req)
                     .send()
-                    .unwrap()
-                    .bytes()
-                    .unwrap()
-                    .to_vec();
+                    .unwrap();
+
+                if !response.status().is_success() {
+                    eprintln!("Server returned error: {}", response.status());
+                    return;
+                }
+
+                let diff_res_raw = response.bytes().unwrap().to_vec();
 
                 #[cfg(feature = "self_https")]
                 let diff_res: DiffRes = {
@@ -288,6 +293,7 @@ fn main() {
         let _delete_res = client
             .post(format!("{server}/delete/{username}"))
             .headers(headers.clone())
+            .header("Content-Type", "application/json")
             .body(delete_req)
             .send()
             .unwrap();

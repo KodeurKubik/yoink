@@ -3,7 +3,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, aead::stream::DecryptorBE32};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -11,6 +11,7 @@ use axum::{
 };
 #[cfg(feature = "self_https")]
 use base64::{Engine, prelude::BASE64_STANDARD};
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use path_clean::PathClean;
 use rusqlite::Connection;
@@ -18,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    sync::{LazyLock, Mutex, OnceLock},
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, LazyLock, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 use tokio::{
     fs::{self, File},
@@ -28,6 +31,8 @@ use tokio::{
 const YOINK_CONFIG_FILE: &str = include_str!(".yoinkconfig");
 const PATH: &str = "data";
 const MAX_BODY_SIZE: usize = 1_000_000_000;
+const RATELIMITER_MAXFAILS: u32 = 2;
+const RATELIMITER_PERSEC: u64 = 15;
 
 // dude idk why this is so long lol
 static YOINK_IGNORE: LazyLock<Vec<String>> = LazyLock::new(|| {
@@ -56,8 +61,40 @@ pub fn get_db() -> &'static Mutex<Connection> {
 #[derive(Clone)]
 struct AppState {
     allow_deletion: bool,
+    failure_counts: Arc<DashMap<IpAddr, (u32, Instant)>>,
     #[cfg(feature = "self_https")]
     https_key: aes_gcm::Aes256Gcm,
+}
+
+impl AppState {
+    pub fn is_limited(&self, ip: IpAddr) -> bool {
+        if let Some(entry) = self.failure_counts.get(&ip) {
+            let (count, reset_at) = *entry;
+            count >= RATELIMITER_MAXFAILS && Instant::now() < reset_at
+        } else {
+            false
+        }
+    }
+
+    pub fn record_failure(&self, ip: IpAddr) {
+        let now = Instant::now();
+
+        self.failure_counts
+            .entry(ip)
+            .and_modify(|(count, reset_at)| {
+                if now >= *reset_at {
+                    *count = 1;
+                    *reset_at =
+                        now + Duration::from_secs(RATELIMITER_PERSEC) / RATELIMITER_MAXFAILS;
+                } else {
+                    *count += 1
+                }
+            })
+            .or_insert((
+                1,
+                now + Duration::from_secs(RATELIMITER_PERSEC) / RATELIMITER_MAXFAILS,
+            ));
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -139,6 +176,7 @@ async fn main() {
         allow_deletion,
         #[cfg(feature = "self_https")]
         https_key: https_key,
+        failure_counts: Arc::new(DashMap::new()),
     };
 
     let app = {
@@ -156,14 +194,17 @@ async fn main() {
             .with_state(state)
     };
 
-    let listener = tokio::net::TcpListener::bind(&server).await.unwrap();
-
     #[cfg(feature = "self_https")]
     println!("Server listening on {server} - with encryption layer");
     #[cfg(not(feature = "self_https"))]
     println!("Server listening on {server}");
 
-    let _ = axum::serve(listener, app).await;
+    let listener = tokio::net::TcpListener::bind(&server).await.unwrap();
+    let _ = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await;
 }
 
 //
@@ -289,14 +330,14 @@ async fn diff_handler(
         a.1.cmp(&b.1)
     });
 
-    let res_raw = serde_json::to_string(&DiffRes {
-        allow_deletion: state.allow_deletion,
-        files: updates,
-    })
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
     #[cfg(feature = "self_https")]
     let res = {
+        let res_raw = serde_json::to_string(&DiffRes {
+            allow_deletion: state.allow_deletion,
+            files: updates,
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
         let nonce = get_header_nonce(&headers)?;
 
         encrypt_https(&res_raw, &state.https_key, &nonce)
@@ -304,7 +345,11 @@ async fn diff_handler(
     };
 
     #[cfg(not(feature = "self_https"))]
-    let res = res_raw.as_bytes().to_vec();
+    let res = serde_json::to_vec(&DiffRes {
+        allow_deletion: state.allow_deletion,
+        files: updates,
+    })
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     println!("Diff request by {username}");
 
@@ -564,12 +609,19 @@ async fn deleter_handler(
 //
 
 async fn auth(
-    #[cfg(feature = "self_https")] State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Path(user_id): Path<String>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    let ip = addr.ip();
+
+    if state.is_limited(ip) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     #[cfg(feature = "self_https")]
     let nonce = get_header_nonce(&headers)?;
 
@@ -581,14 +633,10 @@ async fn auth(
         .map_err(|_| StatusCode::BAD_REQUEST)?
         .to_string();
 
-    println!("Encrypted password received: {xpwd:?}");
-
     #[cfg(feature = "self_https")]
     {
         xpwd = decrypt_str_to_str(&xpwd, &state.https_key, &nonce)?;
     }
-
-    println!("Decrypted to: {xpwd:?}");
 
     let username: String = user_id
         .chars()
@@ -605,6 +653,8 @@ async fn auth(
 
     if !valid {
         println!("Password not valid!");
+
+        state.record_failure(ip);
         return Err(StatusCode::UNAUTHORIZED);
     }
 

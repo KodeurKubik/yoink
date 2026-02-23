@@ -7,6 +7,7 @@ Synchronize a folder over to a distant server. It’s basically a git but overki
 - Per-user storage and password
 - Only updates what changed (using blake3 hashes)
 - SMALL binaries (and FAST) (thanks rust 🦀)
+- Custom RSA encryption (if unsecured / http)
 
 ## Demo:
 
