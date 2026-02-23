@@ -4,10 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ureq = { version = "3", features = ["json", "rustls"] }
+reqwest = { version = "0.13", features = ["json", "blocking"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 blake3 = "1"
 rayon = "1"
+
+base64 = { version = "0.22", optional = true }
+rand = { version = "0.10", optional = true }
+aes-gcm = { version = "0.10", features = ["stream"], optional = true }
 
 [profile.release]
 opt-level = 3
@@ -20,5 +25,7 @@ panic = "abort"
 opt-level = 3
 
 [features]
-default = ["relative"]
+default = ["relative", "log"]
 relative = []
+log = []
+self_https = ["base64", "aes-gcm", "rand"]

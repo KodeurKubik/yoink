@@ -1,12 +1,16 @@
+#[cfg(feature = "self_https")]
+use aes_gcm::{Aes256Gcm, KeyInit, aead::stream::DecryptorBE32};
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::Response,
-    routing::post,
+    routing::{get, post},
 };
+#[cfg(feature = "self_https")]
+use base64::{Engine, prelude::BASE64_STANDARD};
 use futures_util::StreamExt;
 use path_clean::PathClean;
 use rusqlite::Connection;
@@ -52,6 +56,8 @@ pub fn get_db() -> &'static Mutex<Connection> {
 #[derive(Clone)]
 struct AppState {
     allow_deletion: bool,
+    #[cfg(feature = "self_https")]
+    https_key: aes_gcm::Aes256Gcm,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -104,11 +110,41 @@ async fn main() {
         .unwrap();
     }
 
-    let state = AppState { allow_deletion };
+    #[cfg(feature = "self_https")]
+    let https_key = {
+        yoink_config
+            .get("HTTPS_KEY")
+            .map(|v| {
+                let bytes = BASE64_STANDARD
+                    .decode(v)
+                    .expect("Could not parse HTTPS_KEY");
+
+                let key = aes_gcm::Key::<aes_gcm::Aes256Gcm>::from_slice(&bytes).to_owned();
+                let cipher = aes_gcm::Aes256Gcm::new(&key);
+                cipher
+            })
+            .unwrap_or_else(|| {
+                eprintln!("NO HTTPS_KEY SPECIFIED!");
+                eprintln!("If the self_https flag is enabled, you should compile with the HTTPS_KEY config. Here's a randomly generated key:");
+
+                let key = aes_gcm::Aes256Gcm::generate_key(aes_gcm::aead::OsRng);
+                eprintln!("{}\n", BASE64_STANDARD.encode(key));
+
+                let cipher = aes_gcm::Aes256Gcm::new(&key);
+                cipher
+            })
+    };
+
+    let state = AppState {
+        allow_deletion,
+        #[cfg(feature = "self_https")]
+        https_key: https_key,
+    };
 
     let app = {
         let mut tmp = Router::new()
             .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+            .route("/test/{id}", get(tester))
             .route("/diff/{id}", post(diff))
             .route("/upload/{id}", post(upload));
 
@@ -116,12 +152,24 @@ async fn main() {
             tmp = tmp.route("/delete/{id}", post(deleter));
         }
 
-        tmp.route_layer(middleware::from_fn(auth)).with_state(state)
+        tmp.route_layer(middleware::from_fn_with_state(state.clone(), auth))
+            .with_state(state)
     };
 
     let listener = tokio::net::TcpListener::bind(&server).await.unwrap();
+
+    #[cfg(feature = "self_https")]
+    println!("Server listening on {server} - with encryption layer");
+    #[cfg(not(feature = "self_https"))]
     println!("Server listening on {server}");
+
     let _ = axum::serve(listener, app).await;
+}
+
+//
+
+async fn tester() -> &'static str {
+    "Your account works."
 }
 
 //
@@ -137,11 +185,41 @@ struct DiffRes {
     files: Vec<(String, u64, Option<String>)>,
 }
 
+#[cfg(feature = "self_https")]
 async fn diff(
+    headers: HeaderMap,
+    state: State<AppState>,
+    user_id: Path<String>,
+    body: Bytes,
+) -> Result<Bytes, StatusCode> {
+    let nonce = get_header_nonce(&headers)?;
+
+    let data = decrypt_str_to_vec(
+        &String::from_utf8_lossy(&body).to_string(),
+        &state.https_key,
+        &nonce,
+    )?;
+
+    let payload: DiffReq = serde_json::from_slice(&data).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    diff_handler(headers, state, user_id, Json(payload)).await
+}
+
+#[cfg(not(feature = "self_https"))]
+async fn diff(
+    state: State<AppState>,
+    user_id: Path<String>,
+    payload: Json<DiffReq>,
+) -> Result<Bytes, StatusCode> {
+    diff_handler(state, user_id, payload).await
+}
+
+async fn diff_handler(
+    #[cfg(feature = "self_https")] headers: HeaderMap,
     State(state): State<AppState>,
     Path(user_id): Path<String>,
     Json(payload): Json<DiffReq>,
-) -> Result<Json<DiffRes>, StatusCode> {
+) -> Result<Bytes, StatusCode> {
     let username: String = user_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -211,20 +289,52 @@ async fn diff(
         a.1.cmp(&b.1)
     });
 
-    let res = DiffRes {
+    let res_raw = serde_json::to_string(&DiffRes {
         allow_deletion: state.allow_deletion,
         files: updates,
+    })
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    #[cfg(feature = "self_https")]
+    let res = {
+        let nonce = get_header_nonce(&headers)?;
+
+        encrypt_https(&res_raw, &state.https_key, &nonce)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
+
+    #[cfg(not(feature = "self_https"))]
+    let res = res_raw.as_bytes().to_vec();
 
     println!("Diff request by {username}");
 
-    Ok(Json(res))
+    Ok(res.into())
 }
 
 //
 
+#[cfg(feature = "self_https")]
 async fn upload(
     headers: HeaderMap,
+    state: State<AppState>,
+    user_id: Path<String>,
+    body: Body,
+) -> Result<StatusCode, StatusCode> {
+    upload_handler(headers, state, user_id, body).await
+}
+
+#[cfg(not(feature = "self_https"))]
+async fn upload(
+    headers: HeaderMap,
+    user_id: Path<String>,
+    body: Body,
+) -> Result<StatusCode, StatusCode> {
+    upload_handler(headers, user_id, body).await
+}
+
+async fn upload_handler(
+    headers: HeaderMap,
+    #[cfg(feature = "self_https")] state: State<AppState>,
     Path(user_id): Path<String>,
     body: Body,
 ) -> Result<StatusCode, StatusCode> {
@@ -271,13 +381,61 @@ async fn upload(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut stream = body.into_data_stream();
     let mut hasher = blake3::Hasher::new();
+    let mut stream = body.into_data_stream();
 
+    #[cfg(feature = "self_https")]
+    {
+        let streamnonce = get_header_nonce_stream(&headers)?;
+        let mut decryptor = Some(DecryptorBE32::<Aes256Gcm>::from_aead(
+            state.https_key.clone(),
+            &streamnonce,
+        ));
+
+        let mut leftovers = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
+            leftovers.extend_from_slice(&chunk);
+
+            while leftovers.len() > 65536 + 16 {
+                let plaintext = decryptor
+                    .as_mut()
+                    .ok_or(StatusCode::BAD_REQUEST)?
+                    .decrypt_next(&leftovers[..65536 + 16])
+                    .map_err(|_| StatusCode::BAD_REQUEST)?;
+                file.write_all(&plaintext)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                hasher.update(&plaintext);
+                leftovers.drain(..65536 + 16);
+            }
+        }
+
+        let plaintext = decryptor
+            .take()
+            .ok_or(StatusCode::BAD_REQUEST)?
+            .decrypt_last(&leftovers[..])
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        file.write_all(&plaintext)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        hasher.update(&plaintext);
+    }
+
+    #[cfg(not(feature = "self_https"))]
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        hasher.update(&chunk);
-        file.write_all(&chunk)
+
+        #[cfg(feature = "self_https")]
+        let plaintext =
+            decrypt_https(&chunk, &state.https_key, &nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        #[cfg(not(feature = "self_https"))]
+        let plaintext = chunk;
+
+        hasher.update(&plaintext);
+        file.write_all(&plaintext)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
@@ -304,6 +462,9 @@ async fn upload(
     if hash != xhash {
         // uh oh
         // tbh idk what to do, lets just keep file and send specific error to client
+        eprintln!(
+            "File {filename} from user {username} did not match hash, keeping file as backup"
+        );
         return Err(StatusCode::REQUEST_TIMEOUT);
     }
 
@@ -319,7 +480,35 @@ struct DeleteReq {
     files: Vec<String>,
 }
 
+#[cfg(feature = "self_https")]
 async fn deleter(
+    headers: HeaderMap,
+    state: State<AppState>,
+    user_id: Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, StatusCode> {
+    let nonce = get_header_nonce(&headers)?;
+
+    let data = decrypt_str_to_vec(
+        &String::from_utf8_lossy(&body).to_string(),
+        &state.https_key,
+        &nonce,
+    )?;
+
+    let payload: DeleteReq = serde_json::from_slice(&data).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    deleter_handler(user_id, Json(payload)).await
+}
+
+#[cfg(not(feature = "self_https"))]
+async fn deleter(
+    user_id: Path<String>,
+    payload: Json<DeleteReq>,
+) -> Result<StatusCode, StatusCode> {
+    deleter_handler(user_id, payload).await
+}
+
+async fn deleter_handler(
     Path(user_id): Path<String>,
     Json(payload): Json<DeleteReq>,
 ) -> Result<StatusCode, StatusCode> {
@@ -375,16 +564,31 @@ async fn deleter(
 //
 
 async fn auth(
+    #[cfg(feature = "self_https")] State(state): State<AppState>,
     headers: HeaderMap,
     Path(user_id): Path<String>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let xpwd = headers
+    #[cfg(feature = "self_https")]
+    let nonce = get_header_nonce(&headers)?;
+
+    #[allow(unused_mut)]
+    let mut xpwd = headers
         .get("X-Auth")
-        .ok_or(StatusCode::UNAUTHORIZED)?
+        .ok_or(StatusCode::BAD_REQUEST)?
         .to_str()
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .to_string();
+
+    println!("Encrypted password received: {xpwd:?}");
+
+    #[cfg(feature = "self_https")]
+    {
+        xpwd = decrypt_str_to_str(&xpwd, &state.https_key, &nonce)?;
+    }
+
+    println!("Decrypted to: {xpwd:?}");
 
     let username: String = user_id
         .chars()
@@ -393,13 +597,14 @@ async fn auth(
 
     let valid = YOINK_PASS.iter().any(|pwd| {
         if let Some(u_pwd) = pwd.split_once(": ") {
-            return u_pwd.0 == &username && u_pwd.1 == xpwd;
+            return u_pwd.0 == &username && u_pwd.1 == &xpwd;
         } else {
-            return pwd == xpwd;
+            return pwd == &xpwd;
         }
     });
 
     if !valid {
+        println!("Password not valid!");
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -447,4 +652,99 @@ async fn delete_element(filepath: &std::path::PathBuf) -> tokio::io::Result<()> 
             return Ok(());
         }
     }
+}
+
+//
+
+#[cfg(feature = "self_https")]
+fn get_header_nonce_stream(
+    headers: &HeaderMap,
+) -> Result<aes_gcm::Nonce<aes_gcm::aes::cipher::typenum::U7>, StatusCode> {
+    let nonce_header_bytes = headers
+        .get("X-Nonce-Stream")
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .as_bytes();
+
+    let nonce_bytes = BASE64_STANDARD
+        .decode(nonce_header_bytes)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if nonce_bytes.len() != 7 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let nonce = aes_gcm::Nonce::clone_from_slice(&nonce_bytes);
+    Ok(nonce)
+}
+
+#[cfg(feature = "self_https")]
+fn get_header_nonce(
+    headers: &HeaderMap,
+) -> Result<aes_gcm::Nonce<aes_gcm::aes::cipher::typenum::U12>, StatusCode> {
+    let nonce_header_bytes = headers
+        .get("X-Nonce")
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .as_bytes();
+
+    let nonce_bytes = BASE64_STANDARD
+        .decode(nonce_header_bytes)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if nonce_bytes.len() != 12 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let nonce = aes_gcm::Nonce::clone_from_slice(&nonce_bytes);
+    Ok(nonce)
+}
+
+#[cfg(feature = "self_https")]
+fn decrypt_str_to_vec(
+    bytes: &String,
+    cipher: &aes_gcm::Aes256Gcm,
+    nonce: &aes_gcm::Nonce<aes_gcm::aes::cipher::typenum::U12>,
+) -> Result<Vec<u8>, StatusCode> {
+    let decoded = BASE64_STANDARD
+        .decode(bytes)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let decrypted =
+        decrypt_https(&decoded, &cipher, &nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    Ok(decrypted)
+}
+
+#[cfg(feature = "self_https")]
+fn decrypt_str_to_str(
+    bytes: &String,
+    cipher: &aes_gcm::Aes256Gcm,
+    nonce: &aes_gcm::Nonce<aes_gcm::aes::cipher::typenum::U12>,
+) -> Result<String, StatusCode> {
+    Ok(String::from_utf8_lossy(&decrypt_str_to_vec(bytes, cipher, nonce)?).to_string())
+}
+
+//
+
+#[cfg(feature = "self_https")]
+fn encrypt_https(
+    body: &str,
+    cipher: &aes_gcm::Aes256Gcm,
+    nonce: &aes_gcm::Nonce<aes_gcm::aes::cipher::typenum::U12>,
+) -> Result<Vec<u8>, aes_gcm::Error> {
+    use aes_gcm::aead::Aead;
+
+    let dec = cipher.encrypt(nonce, body.as_bytes())?;
+    Ok(dec)
+}
+
+#[cfg(feature = "self_https")]
+fn decrypt_https(
+    body: &[u8],
+    cipher: &aes_gcm::Aes256Gcm,
+    nonce: &aes_gcm::Nonce<aes_gcm::aes::cipher::typenum::U12>,
+) -> Result<Vec<u8>, aes_gcm::Error> {
+    use aes_gcm::aead::Aead;
+
+    let dec = cipher.decrypt(nonce, body)?;
+    Ok(dec)
 }

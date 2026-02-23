@@ -6,3 +6,7 @@ SERVER=0.0.0.0:1984
 
 # Allow users to delete their files
 ALLOW_DELETION=true
+
+# If you enable the self_https flag, specify the encryption key (should be shared with the server)
+# You can generate one by starting the server with the flag and no config value
+HTTPS_KEY=

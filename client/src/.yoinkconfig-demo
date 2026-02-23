@@ -10,3 +10,7 @@ PASSWORD=woohoo am a passwooorddd
 
 # the PATHs of savings™ (split using ','), prefer absolute
 PATH=./this_folder_will_be_sent
+
+# If you enable the self_https flag, specify the encryption key (should be shared with the server)
+# You can generate one by starting the server with the flag and no config value
+HTTPS_KEY=
